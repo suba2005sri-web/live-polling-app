@@ -130,6 +130,13 @@ func main() {
 		c.Next()
 	})
 	routes := r.Group("/api")
+	routes.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "OK",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"service":   "live-polling-api",
+		})
+	})
 	app.routes(routes)
 	server := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
