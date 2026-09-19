@@ -18,11 +18,15 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	redisURL := strings.TrimSpace(os.Getenv("REDIS_URL"))
+	if redisURL == "" {
+		redisURL = strings.TrimSpace(os.Getenv("REDIS_REDIS_URL"))
+	}
 	cfg := Config{
 		Port:           value("PORT", "8080"),
 		MongoURI:       value("MONGODB_URI", ""),
 		MongoDatabase:  value("MONGODB_DATABASE", "live_polling"),
-		RedisURL:       value("REDIS_URL", "redis://localhost:6379/0"),
+		RedisURL:       redisURL,
 		JWTSecret:      value("JWT_SECRET", "change-this-development-secret"),
 		FrontendURL:    value("FRONTEND_URL", "http://localhost:5173"),
 		GoogleClientID: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID")),
@@ -47,14 +51,14 @@ func Load() (Config, error) {
 	if strings.TrimSpace(cfg.MongoDatabase) == "" {
 		return Config{}, fmt.Errorf("MONGODB_DATABASE is not configured")
 	}
-	if cfg.RedisURL == "" {
-		return Config{}, fmt.Errorf("REDIS_URL is not configured")
-	}
 	if strings.TrimSpace(cfg.JWTSecret) == "" {
 		return Config{}, fmt.Errorf("JWT_SECRET is not configured")
 	}
-	if _, err := url.ParseRequestURI(cfg.RedisURL); err != nil {
-		return Config{}, fmt.Errorf("invalid REDIS_URL: %w", err)
+	if cfg.RedisURL != "" {
+		parsedRedis, err := url.ParseRequestURI(cfg.RedisURL)
+		if err != nil || (parsedRedis.Scheme != "redis" && parsedRedis.Scheme != "rediss") || parsedRedis.Host == "" {
+			return Config{}, fmt.Errorf("invalid Redis URL: set REDIS_URL to a redis:// or rediss:// URL")
+		}
 	}
 	return cfg, nil
 }

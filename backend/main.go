@@ -74,11 +74,12 @@ type Comment struct {
 	CreatedAt time.Time `json:"createdAt" bson:"createdAt"`
 }
 type App struct {
-	cfg   config.Config
-	mongo *mongo.Client
-	db    *mongo.Database
-	redis *redis.Client
-	hub   *realtime.Hub
+	cfg        config.Config
+	mongo      *mongo.Client
+	db         *mongo.Database
+	redis      *redis.Client
+	redisReady bool
+	hub        *realtime.Hub
 }
 type claims struct {
 	UserID string `json:"uid"`
@@ -98,21 +99,31 @@ func main() {
 	fmt.Println("MongoDB connected successfully")
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-	redisOptions, err := redis.ParseURL(cfg.RedisURL)
-	if err != nil {
-		_ = client.Disconnect(context.Background())
-		log.Fatalf("Redis connection failed: %v", err)
+	var rdb *redis.Client
+	redisReady := false
+	if cfg.RedisURL == "" {
+		log.Println("Redis is disabled: REDIS_URL is not configured")
+	} else {
+		redisOptions, parseErr := redis.ParseURL(cfg.RedisURL)
+		if parseErr != nil {
+			log.Printf("Redis is disabled: invalid REDIS_URL: %v", parseErr)
+		} else {
+			rdb = redis.NewClient(redisOptions)
+			if pingErr := rdb.Ping(ctx).Err(); pingErr != nil {
+				log.Printf("Redis is unavailable; continuing without Redis: %v", pingErr)
+				_ = rdb.Close()
+				rdb = nil
+			} else {
+				redisReady = true
+				fmt.Println("Redis connected successfully")
+			}
+		}
 	}
-	rdb := redis.NewClient(redisOptions)
-	if err = rdb.Ping(ctx).Err(); err != nil {
-		_ = client.Disconnect(context.Background())
-		_ = rdb.Close()
-		log.Fatalf("Redis connection failed: %v", err)
-	}
-	fmt.Println("Redis connected successfully")
-	app := &App{cfg: cfg, mongo: client, db: client.Database(cfg.MongoDatabase), redis: rdb, hub: realtime.NewHub()}
+	app := &App{cfg: cfg, mongo: client, db: client.Database(cfg.MongoDatabase), redis: rdb, redisReady: redisReady, hub: realtime.NewHub()}
 	app.ensureIndexes(ctx)
-	go app.redisSubscriber()
+	if app.redisReady {
+		go app.redisSubscriber()
+	}
 	r := gin.Default()
 	r.Use(func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
@@ -130,17 +141,10 @@ func main() {
 		c.Next()
 	})
 	routes := r.Group("/api")
-	routes.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "OK",
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-			"service":   "live-polling-api",
-		})
-	})
 	app.routes(routes)
-	server := &http.Server{Addr: ":" + cfg.Port, Handler: r}
+	server := &http.Server{Addr: "0.0.0.0:" + cfg.Port, Handler: r}
 	go func() {
-		fmt.Printf("Backend running on http://localhost:%s\n", cfg.Port)
+		fmt.Printf("Backend running on http://0.0.0.0:%s\n", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Backend server failed: %v", err)
 		}
@@ -151,7 +155,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
-	_ = rdb.Close()
+	if rdb != nil {
+		_ = rdb.Close()
+	}
 	_ = client.Disconnect(shutdownCtx)
 }
 
@@ -177,16 +183,22 @@ func (a *App) routes(r *gin.RouterGroup) {
 		checkCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
 		mongoStatus := "connected"
-		redisStatus := "connected"
+		redisStatus := "disabled"
 		if err := a.mongo.Ping(checkCtx, nil); err != nil {
 			mongoStatus = "disconnected"
 		}
-		if err := a.redis.Ping(checkCtx).Err(); err != nil {
-			redisStatus = "disconnected"
+		if a.redisReady {
+			redisStatus = "connected"
+			if err := a.redis.Ping(checkCtx).Err(); err != nil {
+				redisStatus = "disconnected"
+			}
 		}
 		status := http.StatusOK
-		message := "Backend, MongoDB and Redis are running"
-		if mongoStatus != "connected" || redisStatus != "connected" {
+		message := "Backend and MongoDB are running; Redis is disabled"
+		if redisStatus == "connected" {
+			message = "Backend, MongoDB and Redis are running"
+		}
+		if mongoStatus != "connected" || redisStatus == "disconnected" {
 			status = http.StatusServiceUnavailable
 			message = "One or more backend dependencies are unavailable"
 		}
@@ -378,6 +390,9 @@ func (a *App) getPoll(c *gin.Context) {
 }
 
 func (a *App) syncResults(ctx context.Context, p Poll) {
+	if !a.redisReady {
+		return
+	}
 	values := make(map[string]any, len(p.Options))
 	for _, option := range p.Options {
 		values[option.ID] = option.Votes
@@ -423,7 +438,9 @@ func (a *App) deletePoll(c *gin.Context) {
 	_, _ = a.db.Collection("polls").DeleteOne(c, bson.M{"_id": p.ID})
 	_, _ = a.db.Collection("votes").DeleteMany(c, bson.M{"pollId": p.ID})
 	_, _ = a.db.Collection("comments").DeleteMany(c, bson.M{"pollId": p.ID})
-	_ = a.redis.Del(c, "poll:"+p.ID+":results").Err()
+	if a.redisReady {
+		_ = a.redis.Del(c, "poll:"+p.ID+":results").Err()
+	}
 	c.JSON(200, gin.H{"success": true})
 }
 func (a *App) vote(c *gin.Context) {
@@ -463,10 +480,13 @@ func (a *App) vote(c *gin.Context) {
 		}
 		return
 	}
-	key := "poll:" + p.ID + ":results"
-	count, err := a.redis.HIncrBy(c, key, in.OptionID, 1).Result()
-	if err != nil {
-		count = 0
+	count := int64(0)
+	if a.redisReady {
+		key := "poll:" + p.ID + ":results"
+		count, err = a.redis.HIncrBy(c, key, in.OptionID, 1).Result()
+		if err != nil {
+			count = 0
+		}
 	}
 	p.TotalVotes++
 	for i := range p.Options {
@@ -479,6 +499,9 @@ func (a *App) vote(c *gin.Context) {
 	c.JSON(201, gin.H{"success": true, "message": "Vote registered successfully", "poll": p})
 }
 func (a *App) publish(p Poll) {
+	if !a.redisReady {
+		return
+	}
 	payload := gin.H{"pollId": p.ID, "results": map[string]int64{}, "totalVotes": p.TotalVotes}
 	r := payload["results"].(map[string]int64)
 	for _, o := range p.Options {
@@ -488,6 +511,9 @@ func (a *App) publish(p Poll) {
 	_ = a.redis.Publish(context.Background(), "poll:"+p.ID+":updates", b).Err()
 }
 func (a *App) redisSubscriber() {
+	if !a.redisReady {
+		return
+	}
 	ctx := context.Background()
 	sub := a.redis.PSubscribe(ctx, "poll:*:updates")
 	ch := sub.Channel()
@@ -562,6 +588,10 @@ func (a *App) deleteComment(c *gin.Context) {
 	c.JSON(200, gin.H{"success": true})
 }
 func (a *App) reactions(c *gin.Context) {
+	if !a.redisReady {
+		c.JSON(200, gin.H{})
+		return
+	}
 	pollID := c.Param("id")
 	values, e := a.redis.HGetAll(c, "poll:"+pollID+":reactions").Result()
 	if e != nil {
@@ -571,6 +601,10 @@ func (a *App) reactions(c *gin.Context) {
 	c.JSON(200, values)
 }
 func (a *App) addReaction(c *gin.Context) {
+	if !a.redisReady {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Reactions are temporarily unavailable because Redis is not connected"})
+		return
+	}
 	var in struct {
 		Reaction string `json:"reaction"`
 	}
